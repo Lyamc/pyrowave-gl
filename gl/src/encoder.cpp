@@ -6,6 +6,7 @@
 #include "pack.glsl.inl"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -27,13 +28,13 @@ struct Buffer {
     size_t bytes = 0;
 };
 
-Buffer make_buffer(size_t bytes, const void *data)
+Buffer make_buffer(size_t bytes, const void *data, GLenum usage = GL_DYNAMIC_DRAW)
 {
     Buffer b;
     b.bytes = bytes;
     gl.GenBuffers(1, &b.id);
     gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, b.id);
-    gl.BufferData(GL_SHADER_STORAGE_BUFFER, GLsizeiptr(bytes), data, GL_DYNAMIC_DRAW);
+    gl.BufferData(GL_SHADER_STORAGE_BUFFER, GLsizeiptr(bytes), data, usage);
     return b;
 }
 
@@ -52,20 +53,46 @@ void zero_buffer(const Buffer &b)
                           GL_RED_INTEGER, GL_UNSIGNED_INT, &z);
 }
 
-bool read_buffer(const Buffer &b, void *dst, size_t bytes)
+void sync_for_readback()
 {
-    if (bytes > b.bytes) return false;
     gl.MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
-    gl.Finish();
-    gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, b.id);
-    void *p = gl.MapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, GLsizeiptr(bytes), GL_MAP_READ_BIT);
-    if (p) {
-        std::memcpy(dst, p, bytes);
-        gl.UnmapBuffer(GL_SHADER_STORAGE_BUFFER);
-        return true;
+}
+
+Buffer make_readback(size_t bytes)
+{
+    Buffer b;
+    b.bytes = bytes;
+    gl.GenBuffers(1, &b.id);
+    /* First bind is the pack target so the driver keeps this as a CPU readback heap. */
+    gl.BindBuffer(GL_PIXEL_PACK_BUFFER, b.id);
+    gl.BufferData(GL_PIXEL_PACK_BUFFER, GLsizeiptr(bytes), nullptr, GL_STREAM_READ);
+    return b;
+}
+
+/* Device store, then a pack-buffer copy. Mapping that pack buffer is the GL 4.3 readback. */
+bool dma_read(Buffer &stage, const Buffer &src, size_t offset, void *dst, size_t bytes)
+{
+    if (bytes == 0) return true;
+    if (offset > src.bytes || bytes > src.bytes - offset) return false;
+    if (stage.bytes < bytes) {
+        free_buffer(stage);
+        stage = make_readback(bytes);
     }
-    gl.GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, GLsizeiptr(bytes), dst);
-    return gl.GetError() == 0;
+    gl.BindBuffer(GL_COPY_READ_BUFFER, src.id);
+    gl.BindBuffer(GL_COPY_WRITE_BUFFER, stage.id);
+    gl.CopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, GLintptr(offset), 0, GLsizeiptr(bytes));
+    gl.BindBuffer(GL_PIXEL_PACK_BUFFER, stage.id);
+    void *p = gl.MapBufferRange(GL_PIXEL_PACK_BUFFER, 0, GLsizeiptr(bytes), GL_MAP_READ_BIT);
+    if (!p) return false;
+    std::memcpy(dst, p, bytes);
+    gl.UnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    return true;
+}
+
+void write_bytes(const Buffer &b, size_t offset, const void *src, size_t bytes)
+{
+    gl.BindBuffer(GL_SHADER_STORAGE_BUFFER, b.id);
+    gl.BufferSubData(GL_SHADER_STORAGE_BUFFER, GLintptr(offset), GLsizeiptr(bytes), src);
 }
 
 GLuint build_program(const char *src, std::string *log)
@@ -117,29 +144,45 @@ struct DwtPush {
 };
 static_assert(sizeof(DwtPush) == 64, "DwtPush");
 
+struct QuantBand {
+    float quant_resolution;
+    int32_t block_offset;
+    int32_t layer;
+    int32_t pad;
+};
 struct QuantPush {
     int32_t rx, ry;
     int32_t bx, by;
     float ix, iy;
-    float input_layer;
-    float quant_resolution;
-    int32_t block_offset;
     int32_t block_stride;
     float rdo;
     uint32_t coeff_pitch;
+    int32_t band_count;
+    int32_t pad0, pad1;
+    QuantBand bands[4];
 };
-static_assert(sizeof(QuantPush) == 48, "QuantPush");
+static_assert(sizeof(QuantPush) == 112, "QuantPush");
+static_assert(offsetof(QuantPush, bands) == 48, "QuantPush.bands");
 
+struct PackBand {
+    uint32_t quant_code;
+    int32_t off32;
+    int32_t off8;
+    int32_t pad;
+};
 struct PackPush {
     int32_t rx, ry;
     int32_t b32x, b32y;
     int32_t b8x, b8y;
-    uint32_t quant_code;
     uint32_t seq;
-    int32_t off32, stride32;
-    int32_t off8, stride8;
+    int32_t stride32;
+    int32_t stride8;
+    int32_t band_count;
+    int32_t pad0, pad1;
+    PackBand bands[4];
 };
-static_assert(sizeof(PackPush) == 48, "PackPush");
+static_assert(sizeof(PackPush) == 112, "PackPush");
+static_assert(offsetof(PackPush, bands) == 48, "PackPush.bands");
 
 /* pyrowave_common.hpp. GCC and Clang pack these the same way the Vulkan decoder reads them. */
 struct BitstreamPacket {
@@ -264,7 +307,7 @@ struct Encoder {
     Band bands[3][5];
     bool band_ok[3][5] = {};
 
-    Buffer meta, stats, payload, quant, bitstream, meta_out;
+    Buffer meta, stats, payload, quant, bitstream, meta_out, readback;
     int total8 = 0, total32 = 0;
     size_t payload_bytes = 0, bitstream_bytes = 0, meta_bytes = 0;
 
@@ -331,18 +374,29 @@ pwgl_result upload_planes(Encoder *enc, const pwgl_cpu_buffer *buf)
         if (stride <= 0) stride = enc->pw[c];
         size_t tight = size_t(enc->pw[c]) * size_t(enc->ph[c]);
         size_t bytes = (tight + 3u) & ~size_t(3);
-        std::vector<uint8_t> packed(bytes, 0);
         const auto *src = static_cast<const uint8_t *>(buf->data[c]);
         if (!src) {
             set_error("plane pointer is null");
             return PWGL_ERROR_INVALID_ARGUMENT;
         }
-        for (int y = 0; y < enc->ph[c]; y++) {
-            std::memcpy(packed.data() + size_t(y) * size_t(enc->pw[c]),
-                        src + size_t(y) * size_t(stride), size_t(enc->pw[c]));
+        const uint8_t *upload = src;
+        std::vector<uint8_t> packed;
+        if (stride != enc->pw[c] || bytes != tight) {
+            packed.assign(bytes, 0);
+            for (int y = 0; y < enc->ph[c]; y++) {
+                std::memcpy(packed.data() + size_t(y) * size_t(enc->pw[c]),
+                            src + size_t(y) * size_t(stride), size_t(enc->pw[c]));
+            }
+            upload = packed.data();
+            tight = bytes;
         }
-        free_buffer(enc->planes[c]);
-        enc->planes[c] = make_buffer(bytes, packed.data());
+        if (enc->planes[c].id && enc->planes[c].bytes == bytes) {
+            write_bytes(enc->planes[c], 0, upload, tight);
+        } else {
+            free_buffer(enc->planes[c]);
+            enc->planes[c] = make_buffer(bytes, nullptr);
+            write_bytes(enc->planes[c], 0, upload, tight);
+        }
     }
     return PWGL_SUCCESS;
 }
@@ -382,7 +436,6 @@ pwgl_result create_bands(Encoder *enc)
                 enc->bands[c][l].component = c;
                 enc->band_ok[c][l] = enc->bands[c][l].coeff.id != 0;
             }
-            zero_buffer(enc->bands[c][l].coeff);
         }
     }
     return PWGL_SUCCESS;
@@ -391,17 +444,15 @@ pwgl_result create_bands(Encoder *enc)
 void dispatch_dwt(const DwtPush &pc, GLuint src_bytes, GLuint src_float, GLuint scratch, GLuint coeff,
                   GLuint gx, GLuint gy)
 {
-    for (uint32_t phase = 0; phase < 4; phase++) {
-        DwtPush p = pc;
-        p.phase = phase;
-        upload_ubo(&p, sizeof(p));
-        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, src_bytes);
-        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, scratch);
-        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, coeff);
-        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, src_float);
-        gl.DispatchCompute(gx, gy, 1);
-        barrier();
-    }
+    DwtPush p = pc;
+    p.phase = 0;
+    upload_ubo(&p, sizeof(p));
+    gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, src_bytes);
+    gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, scratch);
+    gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, coeff);
+    gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, src_float);
+    gl.DispatchCompute(gx, gy, 1);
+    barrier();
 }
 
 pwgl_result run_dwt(Encoder *enc)
@@ -530,30 +581,39 @@ pwgl_result alloc_coding(Encoder *enc, size_t cap)
 
 pwgl_result run_quant(Encoder *enc, const std::vector<BandJob> &jobs)
 {
-    zero_buffer(enc->meta);
-    zero_buffer(enc->stats);
-    zero_buffer(enc->payload);
+    /* Each dispatched 8x8 writes its code word, including zeros for a dead block.
+     * Payload byte counter (uint 0) and bitstream word counter (uint 1) share
+     * the first 8 bytes. The body is rewritten before it is read. */
+    uint32_t zeros[2] = {};
+    write_bytes(enc->payload, 0, zeros, sizeof(zeros));
     gl.UseProgram(enc->quant_prog);
-    for (const BandJob &j : jobs) {
+    for (size_t i = 0; i < jobs.size();) {
+        const BandJob &j0 = jobs[i];
         QuantPush pc = {};
-        pc.rx = j.w;
-        pc.ry = j.h;
-        pc.bx = (j.w + 7) / 8;
-        pc.by = (j.h + 7) / 8;
-        pc.ix = 1.0f / float(j.w);
-        pc.iy = 1.0f / float(j.h);
-        pc.input_layer = float(j.band);
-        pc.quant_resolution = quant_resolution_for(j.level, j.component, j.band);
-        pc.block_offset = j.off8;
-        pc.block_stride = j.stride8;
+        pc.rx = j0.w;
+        pc.ry = j0.h;
+        pc.bx = (j0.w + 7) / 8;
+        pc.by = (j0.h + 7) / 8;
+        pc.ix = 1.0f / float(j0.w);
+        pc.iy = 1.0f / float(j0.h);
+        pc.block_stride = j0.stride8;
         pc.rdo = 1.0f / 256.0f;
-        pc.coeff_pitch = uint32_t(j.pitch);
+        pc.coeff_pitch = uint32_t(j0.pitch);
+        int n = 0;
+        while (i < jobs.size() && n < 4 && jobs[i].level == j0.level && jobs[i].component == j0.component) {
+            pc.bands[n].quant_resolution = quant_resolution_for(jobs[i].level, jobs[i].component, jobs[i].band);
+            pc.bands[n].block_offset = jobs[i].off8;
+            pc.bands[n].layer = jobs[i].band;
+            n++;
+            i++;
+        }
+        pc.band_count = n;
         upload_ubo(&pc, sizeof(pc));
-        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, enc->bands[j.component][j.level].coeff.id);
+        gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, enc->bands[j0.component][j0.level].coeff.id);
         gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, enc->meta.id);
         gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, enc->stats.id);
         gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, enc->payload.id);
-        gl.DispatchCompute(GLuint(pc.bx), GLuint(pc.by), 1);
+        gl.DispatchCompute(GLuint(pc.bx), GLuint(pc.by), GLuint(n));
         barrier();
     }
     return PWGL_SUCCESS;
@@ -563,30 +623,36 @@ pwgl_result run_pack(Encoder *enc, const std::vector<BandJob> &jobs)
 {
     /* Rate control stays at quant 0, matching pyrowave-dx11 v0.1.1. */
     zero_buffer(enc->quant);
-    zero_buffer(enc->bitstream);
     zero_buffer(enc->meta_out);
     gl.UseProgram(enc->pack_prog);
-    for (const BandJob &j : jobs) {
+    for (size_t i = 0; i < jobs.size();) {
+        const BandJob &j0 = jobs[i];
         PackPush pc = {};
-        pc.rx = j.w;
-        pc.ry = j.h;
-        pc.b32x = (j.w + 31) / 32;
-        pc.b32y = (j.h + 31) / 32;
-        pc.b8x = (j.w + 7) / 8;
-        pc.b8y = (j.h + 7) / 8;
-        pc.quant_code = quant_code_for_band(j.level, j.component, j.band);
+        pc.rx = j0.w;
+        pc.ry = j0.h;
+        pc.b32x = (j0.w + 31) / 32;
+        pc.b32y = (j0.h + 31) / 32;
+        pc.b8x = (j0.w + 7) / 8;
+        pc.b8y = (j0.h + 7) / 8;
         pc.seq = enc->sequence_code;
-        pc.off32 = j.off32;
-        pc.stride32 = j.stride32;
-        pc.off8 = j.off8;
-        pc.stride8 = j.stride8;
+        pc.stride32 = j0.stride32;
+        pc.stride8 = j0.stride8;
+        int n = 0;
+        while (i < jobs.size() && n < 4 && jobs[i].level == j0.level && jobs[i].component == j0.component) {
+            pc.bands[n].quant_code = quant_code_for_band(jobs[i].level, jobs[i].component, jobs[i].band);
+            pc.bands[n].off32 = jobs[i].off32;
+            pc.bands[n].off8 = jobs[i].off8;
+            n++;
+            i++;
+        }
+        pc.band_count = n;
         upload_ubo(&pc, sizeof(pc));
         gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, enc->bitstream.id);
         gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, enc->meta_out.id);
         gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, enc->meta.id);
         gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, enc->payload.id);
         gl.BindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, enc->quant.id);
-        gl.DispatchCompute(GLuint((pc.b32x + 1) / 2), GLuint((pc.b32y + 1) / 2), 1);
+        gl.DispatchCompute(GLuint((pc.b32x + 1) / 2), GLuint((pc.b32y + 1) / 2), GLuint(n));
         barrier();
     }
     return PWGL_SUCCESS;
@@ -777,10 +843,21 @@ pwgl_result pwgl_encoder_encode_cpu(pwgl_encoder enc_h, const pwgl_cpu_buffer *b
     hr = run_pack(enc, jobs);
     if (hr != PWGL_SUCCESS) return hr;
 
-    enc->host_bitstream.resize(enc->bitstream_bytes);
+    sync_for_readback();
+    uint32_t head[2] = {};
+    if (!dma_read(enc->readback, enc->payload, 0, head, sizeof(head))) {
+        set_error("readback failed");
+        return PWGL_ERROR_GENERIC;
+    }
+    size_t bit_bytes = size_t(head[1]) * 4u;
+    if (bit_bytes > enc->bitstream.bytes) {
+        set_error("bitstream counter past the buffer");
+        return PWGL_ERROR_GENERIC;
+    }
+    enc->host_bitstream.resize(bit_bytes);
     enc->host_meta.resize(enc->meta_bytes);
-    if (!read_buffer(enc->bitstream, enc->host_bitstream.data(), enc->bitstream_bytes) ||
-        !read_buffer(enc->meta_out, enc->host_meta.data(), enc->meta_bytes)) {
+    if (!dma_read(enc->readback, enc->bitstream, 0, enc->host_bitstream.data(), bit_bytes) ||
+        !dma_read(enc->readback, enc->meta_out, 0, enc->host_meta.data(), enc->meta_bytes)) {
         set_error("readback failed");
         return PWGL_ERROR_GENERIC;
     }
@@ -841,5 +918,6 @@ void pwgl_encoder_destroy(pwgl_encoder enc_h)
     free_buffer(enc->quant);
     free_buffer(enc->bitstream);
     free_buffer(enc->meta_out);
+    free_buffer(enc->readback);
     delete enc;
 }

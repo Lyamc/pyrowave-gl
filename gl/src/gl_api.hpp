@@ -25,7 +25,11 @@ typedef uint8_t GLubyte;
 #define GL_SHADER_STORAGE_BUFFER 0x90D2
 #define GL_UNIFORM_BUFFER 0x8A11
 #define GL_DYNAMIC_DRAW 0x88E8
+#define GL_STREAM_READ 0x88E1
 #define GL_MAP_READ_BIT 0x0001
+#define GL_COPY_READ_BUFFER 0x8F36
+#define GL_COPY_WRITE_BUFFER 0x8F37
+#define GL_PIXEL_PACK_BUFFER 0x88EB
 #define GL_SHADER_STORAGE_BARRIER_BIT 0x00002000
 #define GL_BUFFER_UPDATE_BARRIER_BIT 0x00000200
 #define GL_R32UI 0x8236
@@ -55,6 +59,7 @@ struct GlApiFns {
     void (*BufferData)(GLenum, GLsizeiptr, const void *, GLenum);
     void (*BufferSubData)(GLenum, GLintptr, GLsizeiptr, const void *);
     void (*GetBufferSubData)(GLenum, GLintptr, GLsizeiptr, void *);
+    void (*CopyBufferSubData)(GLenum, GLenum, GLintptr, GLintptr, GLsizeiptr);
     void (*BindBufferBase)(GLenum, GLuint, GLuint);
     void *(*MapBufferRange)(GLenum, GLintptr, GLsizeiptr, GLbitfield);
     GLboolean (*UnmapBuffer)(GLenum);

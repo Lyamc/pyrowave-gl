@@ -103,6 +103,7 @@ bool load_gl(PFN_eglGetProcAddress get_proc, char *err, size_t err_len)
         {"glBufferData", (void **)&gl.BufferData},
         {"glBufferSubData", (void **)&gl.BufferSubData},
         {"glGetBufferSubData", (void **)&gl.GetBufferSubData},
+        {"glCopyBufferSubData", (void **)&gl.CopyBufferSubData},
         {"glBindBufferBase", (void **)&gl.BindBufferBase},
         {"glMapBufferRange", (void **)&gl.MapBufferRange},
         {"glUnmapBuffer", (void **)&gl.UnmapBuffer},

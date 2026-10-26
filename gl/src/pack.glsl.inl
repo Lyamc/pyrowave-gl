@@ -6,19 +6,23 @@
 static const char *kPackComp = R"GL(#version 430
 layout(local_size_x = 64) in;
 
+struct BandP {
+    uint quant_code;
+    int off32;
+    int off8;
+    int _pad;
+};
+
 layout(std140, binding = 0) uniform Push {
-    int resolution_x;
-    int resolution_y;
-    int resolution_32x32_blocks_x;
-    int resolution_32x32_blocks_y;
-    int resolution_8x8_blocks_x;
-    int resolution_8x8_blocks_y;
-    uint quant_resolution_code;
+    ivec2 resolution;
+    ivec2 resolution_32x32_blocks;
+    ivec2 resolution_8x8_blocks;
     uint sequence_code;
-    int block_offset_32x32;
     int block_stride_32x32;
-    int block_offset_8x8;
     int block_stride_8x8;
+    int band_count;
+    ivec2 _pad_align;
+    BandP bands[4];
 };
 
 layout(std430, binding = 1) buffer Bitstream { uint u0[]; };
@@ -101,6 +105,16 @@ void pkt_put_byte(uint blk, uint local_byte, uint value)
 
 void main()
 {
+    int band_i = int(gl_WorkGroupID.z);
+    uint quant_resolution_code = bands[band_i].quant_code;
+    int block_offset_32x32 = bands[band_i].off32;
+    int block_offset_8x8 = bands[band_i].off8;
+    int resolution_x = resolution.x;
+    int resolution_y = resolution.y;
+    int resolution_32x32_blocks_x = resolution_32x32_blocks.x;
+    int resolution_32x32_blocks_y = resolution_32x32_blocks.y;
+    int resolution_8x8_blocks_x = resolution_8x8_blocks.x;
+    int resolution_8x8_blocks_y = resolution_8x8_blocks.y;
     uint gi = gl_LocalInvocationIndex;
     uint blk = gi >> 4;
     for (uint w = gi; w < 4u * MAX_PACKET_WORDS; w += 64u) gs_pkt[w] = 0u;

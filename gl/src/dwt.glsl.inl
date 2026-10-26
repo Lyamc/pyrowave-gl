@@ -39,20 +39,21 @@ const int BLOCK_SIZE_HALF = 16;
 const int SHARED_STRIDE = 64;
 
 uint local_index;
-uint read_base;
-uint write_base;
+int read_slot;
+int write_slot;
+
+/* One tile is 20*64 vec2. Phase 1 writes the second slot; 20*64*2*8 = 20480 bytes,
+ * under the 32 KB GL 4.3 shared-memory floor. Each group owns its tile. */
+shared vec2 gs_tile[2][20 * 64];
 
 vec2 load_shared(int y, int x)
 {
-    uint i = (read_base + uint(y * SHARED_STRIDE + x)) * 2u;
-    return vec2(uScratch[i], uScratch[i + 1u]);
+    return gs_tile[read_slot][y * SHARED_STRIDE + x];
 }
 
 void store_shared(int y, int x, vec2 v)
 {
-    uint i = (write_base + uint(y * SHARED_STRIDE + x)) * 2u;
-    uScratch[i] = v.x;
-    uScratch[i + 1u] = v.y;
+    gs_tile[write_slot][y * SHARED_STRIDE + x] = v;
 }
 
 ivec2 unswizzle8x8(uint index)
@@ -208,24 +209,30 @@ void forward_transform4x2(bool active_lane, int y_offset)
 void main()
 {
     local_index = gl_LocalInvocationIndex;
-    uint tile = (gl_WorkGroupID.y * groups_x + gl_WorkGroupID.x) * uint(20 * SHARED_STRIDE);
-    read_base = tile + ((phase == 2u) ? slot_stride : 0u);
-    write_base = tile + ((phase == 1u) ? slot_stride : 0u);
 
-    if (phase == 0u) {
-        load_image_with_apron(gl_WorkGroupID.xy);
-        return;
-    }
-    if (phase == 1u) {
-        forward_transform8x2();
-        forward_transform4x2(local_index < 32u, BLOCK_SIZE_HALF);
-        return;
-    }
-    if (phase == 2u) {
-        forward_transform8x2();
-        return;
-    }
+    /* Four phases of one group, in order. A shared-memory barrier replaces the
+     * host dispatch between phases; no other group reads this tile. */
+    read_slot = 0;
+    write_slot = 0;
+    load_image_with_apron(gl_WorkGroupID.xy);
+    memoryBarrierShared();
+    barrier();
 
+    read_slot = 0;
+    write_slot = 1;
+    forward_transform8x2();
+    forward_transform4x2(local_index < 32u, BLOCK_SIZE_HALF);
+    memoryBarrierShared();
+    barrier();
+
+    read_slot = 1;
+    write_slot = 0;
+    forward_transform8x2();
+    memoryBarrierShared();
+    barrier();
+
+    read_slot = 0;
+    write_slot = 0;
     int out_w = aligned_resolution.x >> 1;
     int out_h = aligned_resolution.y >> 1;
     ivec2 lc = unswizzle8x8(local_index);

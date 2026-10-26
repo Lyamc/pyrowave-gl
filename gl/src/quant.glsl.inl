@@ -4,16 +4,23 @@
 static const char *kQuantComp = R"GL(#version 430
 layout(local_size_x = 8) in;
 
+struct BandQ {
+    float quant_resolution;
+    int block_offset;
+    int layer;
+    int _pad;
+};
+
 layout(std140, binding = 0) uniform Push {
     ivec2 resolution;
     ivec2 resolution_8x8_blocks;
     vec2 inv_resolution;
-    float input_layer;
-    float quant_resolution;
-    int block_offset;
     int block_stride;
     float rdo_distortion_scale;
     uint coeff_pitch;
+    int band_count;
+    ivec2 _pad_align;
+    BandQ bands[4];
 };
 
 layout(std430, binding = 1) readonly buffer CoeffIn { float coeff[]; };
@@ -82,6 +89,10 @@ void store_stats4(uint byte_off, uvec4 v)
 
 void main()
 {
+    int band_i = int(gl_WorkGroupID.z);
+    float quant_resolution = bands[band_i].quant_resolution;
+    int block_offset = bands[band_i].block_offset;
+    int input_layer = bands[band_i].layer;
     uint gi = gl_LocalInvocationIndex;
     for (int zi = int(gi); zi < 640; zi += 8) gs_staging[zi] = 0u;
     if (gi == 0u) {
@@ -164,8 +175,6 @@ void main()
     if (lane == 0u && in_bounds && !live) {
         store_u32(block_linear * 8u, 0u);
         store_u32(block_linear * 8u + 4u, 0u);
-        u1[(block_linear * 64u) >> 2] = 0u;
-        u1[(block_linear * 64u + 4u) >> 2] = 0u;
     }
 
     int msb = live ? msb_of(uint(max_abs)) : -1;
@@ -271,79 +280,6 @@ void main()
         code_word |= merged;
         store_u32(block_linear * 8u, code_word);
         store_u32(block_linear * 8u + 4u, uint(cluster_base));
-
-        int wave8_num_significants = 0;
-        for (int sig_i = 0; sig_i < 8; sig_i++) {
-            int sig = 0;
-            for (int kk = 0; kk < 8; kk++) {
-                if (abs(gs_tex[gi + uint(sig_i)][kk]) >= 1.0) sig++;
-            }
-            wave8_num_significants += sig;
-        }
-        int mag_bytes = 0;
-        for (uint mb = 0u; mb < 8u; mb++)
-            mag_bytes += max(gs_early[mb] - 1, 0);
-        int late_bits_0 = 8 * mag_bytes + wave8_num_significants;
-        uint errors_0 = uint(late_bits_0 & 0xffff) << 16;
-        uint num_planes = uint(msb + 1);
-        if (msb + 1 > 14) atomicAdd(gs_overflow, 1);
-        store_stats4(block_linear * 64u, uvec4(num_planes, errors_0, 0u, 0u));
-
-        float inv_quant_sq = (1.0 / (quant_resolution * quant_scale));
-        inv_quant_sq = inv_quant_sq * inv_quant_sq;
-        float square_sum = 0.0;
-        for (int ti = 0; ti < 8; ti++) {
-            for (int kk = 0; kk < 8; kk++) {
-                float tv = gs_tex[uint(ti)][kk];
-                square_sum += tv * tv;
-            }
-        }
-        square_sum *= inv_quant_sq;
-        uint errors_msb1 = f32tof16(min(square_sum, 60000.0));
-        if (msb + 1 <= 14) {
-            store_stats4(block_linear * 64u + uint(msb + 1) * 8u, uvec4(errors_msb1, 0u, 0u, 0u));
-        }
-
-        for (int q = 1; q <= msb; q++) {
-            float cluster_err = 0.0;
-            int cluster_late = 0;
-            for (int ti = 0; ti < 8; ti++) {
-                float thread_err = 0.0;
-                for (int kk = 0; kk < 8; kk++) {
-                    float v = abs(gs_tex[uint(ti)][kk]);
-                    float iv = floor(v * make_pow2(-q));
-                    iv += (iv != 0.0) ? 0.5 : 0.0;
-                    iv = trunc(iv * make_pow2(q));
-                    float err = v - iv;
-                    thread_err += err * err;
-                }
-                thread_err *= rdo_distortion_scale * inv_quant_sq;
-                cluster_err += thread_err;
-            }
-            for (int tj = 0; tj < 8; tj++) {
-                int b4x2_t = gs_b4x2[uint(tj)];
-                int shifted = b4x2_t >> q;
-                int msb_q = msb - q;
-                int qp_local = 0;
-                if (msb_q >= 3) {
-                    qp_local = msb_q - 2;
-                    shifted >>= qp_local;
-                }
-                int enc_early = (shifted > 0) ? 1 : 0;
-                if (msb_q >= 3) enc_early = qp_local + 1;
-                enc_early += msb_of(uint(shifted)) + 1;
-                int t_sig = 0;
-                for (int kk = 0; kk < 8; kk++) {
-                    float v = abs(gs_tex[uint(tj)][kk]);
-                    float scaled = v * make_pow2(-q);
-                    t_sig += (scaled >= 1.0) ? 1 : 0;
-                }
-                cluster_late += 8 * max(enc_early - 1, 0) + t_sig;
-            }
-            uint err_packed = f32tof16(min(cluster_err, 60000.0));
-            uint late_packed = uint(cluster_late & 0xffff) << 16;
-            store_stats4(block_linear * 64u + uint(q) * 8u, uvec4(err_packed | late_packed, 0u, 0u, 0u));
-        }
     }
     barrier();
 
