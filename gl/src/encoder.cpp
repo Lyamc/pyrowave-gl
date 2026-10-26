@@ -430,8 +430,13 @@ pwgl_result run_dwt(Encoder *enc)
         dispatch_dwt(pc, bytes, floats, enc->scratch.id, dst.coeff.id, gx, gy);
     };
 
-    run(enc->planes[0].id, enc->dummy.id, uint32_t(enc->pw[0]), 0u, enc->bands[0][0],
-        enc->pw[0], enc->ph[0], enc->aw, enc->ah, true);
+    /* 4:2:0 starts chroma at level 1 from the half-resolution planes.
+     * 4:4:4 runs a level-0 transform on every full-resolution plane. */
+    int level0_components = enc->chroma == PWGL_CHROMA_SUBSAMPLING_444 ? 3 : 1;
+    for (int c = 0; c < level0_components; c++) {
+        run(enc->planes[c].id, enc->dummy.id, uint32_t(enc->pw[c]), 0u, enc->bands[c][0],
+            enc->pw[c], enc->ph[c], enc->aw, enc->ah, true);
+    }
 
     for (int l = 1; l < 5; l++) {
         for (int c = 0; c < 3; c++) {

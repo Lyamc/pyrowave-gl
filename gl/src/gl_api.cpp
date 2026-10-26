@@ -16,6 +16,11 @@ constexpr unsigned EGL_NONE = 0x3038;
 constexpr int EGL_SUCCESS = 0x3000;
 constexpr unsigned EGL_CONTEXT_MAJOR_VERSION = 0x3098;
 constexpr unsigned EGL_CONTEXT_MINOR_VERSION = 0x30FB;
+/* Radeon HD 6670 implements OpenGL 4.4 (Catalyst 14.4, Khronos GLCTS 4.4).
+ * Ask for 4.3, the compute-shader version inside that ceiling. */
+constexpr int kGlMajor = 4;
+constexpr int kGlMinor = 3;
+static_assert(kGlMajor < 4 || (kGlMajor == 4 && kGlMinor <= 4), "above the HD 6670 OpenGL ceiling");
 constexpr unsigned EGL_CONTEXT_OPENGL_PROFILE_MASK = 0x30FD;
 constexpr unsigned EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT = 0x00000001;
 constexpr unsigned EGL_PLATFORM_DEVICE_EXT = 0x313F;
@@ -227,8 +232,8 @@ int gl_init(int adapter_index, int allow_software, char *renderer, size_t render
     }
 
     const EGLint attribs[] = {
-        EGLint(EGL_CONTEXT_MAJOR_VERSION), 4,
-        EGLint(EGL_CONTEXT_MINOR_VERSION), 3,
+        EGLint(EGL_CONTEXT_MAJOR_VERSION), kGlMajor,
+        EGLint(EGL_CONTEXT_MINOR_VERSION), kGlMinor,
         EGLint(EGL_CONTEXT_OPENGL_PROFILE_MASK), EGLint(EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT),
         EGLint(EGL_NONE),
     };
@@ -273,7 +278,7 @@ int gl_init(int adapter_index, int allow_software, char *renderer, size_t render
     GLint vmaj = 0, vmin = 0;
     gl.GetIntegerv(GL_MAJOR_VERSION, &vmaj);
     gl.GetIntegerv(GL_MINOR_VERSION, &vmin);
-    if (vmaj < 4 || (vmaj == 4 && vmin < 3)) {
+    if (vmaj < kGlMajor || (vmaj == kGlMajor && vmin < kGlMinor)) {
         set_err(err, err_len, "OpenGL 4.3 is required");
         return -1;
     }
