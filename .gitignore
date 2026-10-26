@@ -1,4 +1,5 @@
 /cmake-build-*
+/gl/build
 *.iml
 /.idea
 /Granite

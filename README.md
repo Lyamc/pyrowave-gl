@@ -4,6 +4,8 @@ PyroWave is an intra-only video codec (practically speaking a still-image codec)
 that is optimized for extremely fast GPU encode (< ~0.1 ms encode and decode at 1080p, < ~0.2 ms at 4K).
 It is fully implemented in Vulkan compute shaders.
 
+This tree also has an OpenGL 4.3 compute encoder in [`gl/`](gl/README.md). The Vulkan encoder is unchanged.
+
 The targeted bit-rates are quite high (~200+ mbit/s) and the intended use case is
 local network game streaming over ethernet with absolute minimum latency where bandwidth is less of a concern.
 
