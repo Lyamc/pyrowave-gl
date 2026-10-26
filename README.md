@@ -6,6 +6,8 @@ It is fully implemented in Vulkan compute shaders.
 
 This tree also has an OpenGL 4.3 compute encoder in [`gl/`](gl/README.md). The Vulkan encoder is unchanged.
 
+On HYTE's RTX 3060 (2026-10-26, same synthetic I420 frame and the same rate cap as pyrowave-dx11), that OpenGL encoder averages 2.64 ms at 1280×720 and 4.19 ms at 1920×1080. It packs the whole quant-0 pyramid: 1,324,828 bytes and 2,831,224 bytes. Lavapipe, Vulkan, and D3D11 on the same machine are in the table in [`gl/README.md`](gl/README.md).
+
 The targeted bit-rates are quite high (~200+ mbit/s) and the intended use case is
 local network game streaming over ethernet with absolute minimum latency where bandwidth is less of a concern.
 

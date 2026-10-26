@@ -3,8 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
-/* GL 4.3 entry points this encoder calls. Loaded from EGL so the library
- * does not link libGL.
+/* GL 4.3 entry points this encoder calls. Loaded from EGL on Linux, or from
+ * WGL on Windows, so the library does not link libGL.
  */
 
 typedef uint32_t GLenum;

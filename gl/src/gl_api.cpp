@@ -1,26 +1,43 @@
 #include "gl_api.hpp"
 
-#include <dlfcn.h>
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+/* windows.h defines MemoryBarrier as a compiler intrinsic. The GL
+ * function pointer uses that name. */
+#  undef MemoryBarrier
+#else
+#  include <dlfcn.h>
+#  include <fstream>
+#  include <string>
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
-#include <fstream>
-#include <string>
 
 GlApiFns gl;
 
 namespace {
 
-constexpr unsigned EGL_OPENGL_API = 0x30A2;
-constexpr unsigned EGL_NONE = 0x3038;
-constexpr int EGL_SUCCESS = 0x3000;
-constexpr unsigned EGL_CONTEXT_MAJOR_VERSION = 0x3098;
-constexpr unsigned EGL_CONTEXT_MINOR_VERSION = 0x30FB;
+using GetProcFn = void *(*)(const char *);
+
 /* Radeon HD 6670 implements OpenGL 4.4 (Catalyst 14.4, Khronos GLCTS 4.4).
  * Ask for 4.3, the compute-shader version inside that ceiling. */
 constexpr int kGlMajor = 4;
 constexpr int kGlMinor = 3;
 static_assert(kGlMajor < 4 || (kGlMajor == 4 && kGlMinor <= 4), "above the HD 6670 OpenGL ceiling");
+
+#ifndef _WIN32
+constexpr unsigned EGL_OPENGL_API = 0x30A2;
+constexpr unsigned EGL_NONE = 0x3038;
+constexpr int EGL_SUCCESS = 0x3000;
+constexpr unsigned EGL_CONTEXT_MAJOR_VERSION = 0x3098;
+constexpr unsigned EGL_CONTEXT_MINOR_VERSION = 0x30FB;
 constexpr unsigned EGL_CONTEXT_OPENGL_PROFILE_MASK = 0x30FD;
 constexpr unsigned EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT = 0x00000001;
 constexpr unsigned EGL_PLATFORM_DEVICE_EXT = 0x313F;
@@ -74,6 +91,7 @@ PFN_eglTerminate eglTerminate_ = nullptr;
 PFN_eglMakeCurrent eglMakeCurrent_ = nullptr;
 PFN_eglDestroyContext eglDestroyContext_ = nullptr;
 PFN_eglDestroySurface eglDestroySurface_ = nullptr;
+#endif
 
 void set_err(char *err, size_t n, const char *msg)
 {
@@ -81,7 +99,7 @@ void set_err(char *err, size_t n, const char *msg)
     std::snprintf(err, n, "%s", msg);
 }
 
-bool load_gl(PFN_eglGetProcAddress get_proc, char *err, size_t err_len)
+bool load_gl(GetProcFn get_proc, char *err, size_t err_len)
 {
     struct Item { const char *name; void **dst; };
     Item items[] = {
@@ -129,6 +147,7 @@ bool load_gl(PFN_eglGetProcAddress get_proc, char *err, size_t err_len)
     return true;
 }
 
+#ifndef _WIN32
 void *try_dlopen(const char *path)
 {
     void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
@@ -310,3 +329,143 @@ void gl_shutdown(void)
     lib = nullptr;
     gl = {};
 }
+
+#else
+
+} // namespace
+
+/* The process that first loads OpenGL must export these so an Optimus
+ * machine (RTX 3060 plus UHD 770 on HYTE) creates the context on the
+ * discrete GPU. A DLL export alone is not consulted. The bench exe
+ * exports the same symbols. */
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+
+namespace {
+
+HMODULE opengl32 = nullptr;
+HWND hwnd = nullptr;
+HDC hdc = nullptr;
+HGLRC hglrc = nullptr;
+ATOM window_class = 0;
+
+void *wgl_proc(const char *name)
+{
+    void *fn = (void *)wglGetProcAddress(name);
+    /* wglGetProcAddress returns a small integer on failure. 1.1 entry
+     * points live in opengl32.dll and come back as NULL here. */
+    intptr_t v = (intptr_t)fn;
+    if (fn && v != 1 && v != 2 && v != 3 && v != -1) return fn;
+    if (!opengl32) return nullptr;
+    return (void *)GetProcAddress(opengl32, name);
+}
+
+} // namespace
+
+int gl_init(int adapter_index, int allow_software, char *renderer, size_t renderer_len, char *err, size_t err_len)
+{
+    if (hglrc) return 0;
+    if (adapter_index > 0) {
+        set_err(err, err_len, "WGL uses the high-performance adapter; pass adapter_index -1 or 0");
+        return -1;
+    }
+    opengl32 = LoadLibraryA("opengl32.dll");
+    if (!opengl32) {
+        set_err(err, err_len, "LoadLibrary opengl32.dll failed");
+        return -1;
+    }
+
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = inst;
+    wc.lpszClassName = L"pwgl_hidden";
+    window_class = RegisterClassW(&wc);
+    hwnd = CreateWindowW(L"pwgl_hidden", L"pwgl", WS_OVERLAPPEDWINDOW,
+                         0, 0, 16, 16, nullptr, nullptr, inst, nullptr);
+    if (!hwnd) {
+        char buf[80];
+        std::snprintf(buf, sizeof(buf), "CreateWindow failed %lu", GetLastError());
+        set_err(err, err_len, buf);
+        return -1;
+    }
+    hdc = GetDC(hwnd);
+    PIXELFORMATDESCRIPTOR pfd = {};
+    pfd.nSize = sizeof(pfd);
+    pfd.nVersion = 1;
+    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL;
+    pfd.iPixelType = PFD_TYPE_RGBA;
+    pfd.cColorBits = 24;
+    pfd.iLayerType = PFD_MAIN_PLANE;
+    int fmt = ChoosePixelFormat(hdc, &pfd);
+    if (fmt == 0 || !SetPixelFormat(hdc, fmt, &pfd)) {
+        set_err(err, err_len, "SetPixelFormat failed");
+        return -1;
+    }
+    HGLRC dummy = wglCreateContext(hdc);
+    if (!dummy || !wglMakeCurrent(hdc, dummy)) {
+        set_err(err, err_len, "wgl dummy context failed");
+        return -1;
+    }
+    using PFN_wglCreateContextAttribsARB = HGLRC (WINAPI *)(HDC, HGLRC, const int *);
+    auto create_attribs = (PFN_wglCreateContextAttribsARB)wglGetProcAddress("wglCreateContextAttribsARB");
+    if (!create_attribs) {
+        set_err(err, err_len, "wglCreateContextAttribsARB missing");
+        return -1;
+    }
+    const int attribs[] = {
+        0x2091, kGlMajor, /* WGL_CONTEXT_MAJOR_VERSION_ARB */
+        0x2092, kGlMinor, /* WGL_CONTEXT_MINOR_VERSION_ARB */
+        0x9126, 0x00000001, /* WGL_CONTEXT_PROFILE_MASK_ARB, core */
+        0
+    };
+    HGLRC core = create_attribs(hdc, nullptr, attribs);
+    wglMakeCurrent(nullptr, nullptr);
+    wglDeleteContext(dummy);
+    if (!core || !wglMakeCurrent(hdc, core)) {
+        set_err(err, err_len, "OpenGL 4.3 core context failed");
+        return -1;
+    }
+    hglrc = core;
+    if (!load_gl(wgl_proc, err, err_len)) return -1;
+    GLint vmaj = 0, vmin = 0;
+    gl.GetIntegerv(GL_MAJOR_VERSION, &vmaj);
+    gl.GetIntegerv(GL_MINOR_VERSION, &vmin);
+    if (vmaj < kGlMajor || (vmaj == kGlMajor && vmin < kGlMinor)) {
+        set_err(err, err_len, "OpenGL 4.3 is required");
+        return -1;
+    }
+    const char *rend = (const char *)gl.GetString(GL_RENDERER);
+    if (!rend) rend = "";
+    if (renderer && renderer_len) std::snprintf(renderer, renderer_len, "%s", rend);
+    if (!allow_software) {
+        if (std::strstr(rend, "llvmpipe") || std::strstr(rend, "softpipe") || std::strstr(rend, "SwiftShader") ||
+            std::strstr(rend, "GDI Generic") || std::strstr(rend, "Microsoft Basic Render")) {
+            set_err(err, err_len, "software renderer rejected");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+void gl_shutdown(void)
+{
+    if (hglrc) {
+        wglMakeCurrent(nullptr, nullptr);
+        wglDeleteContext(hglrc);
+        hglrc = nullptr;
+    }
+    if (hwnd && hdc) ReleaseDC(hwnd, hdc);
+    hdc = nullptr;
+    if (hwnd) DestroyWindow(hwnd);
+    hwnd = nullptr;
+    if (window_class) {
+        UnregisterClassW(L"pwgl_hidden", GetModuleHandleW(nullptr));
+        window_class = 0;
+    }
+    gl = {};
+}
+
+#endif
