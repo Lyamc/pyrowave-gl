@@ -469,6 +469,8 @@ std::vector<BandJob> build_jobs(Encoder *enc)
             int b8y = (b.h + 7) / 8;
             int b32x = (b.w + 31) / 32;
             int b32y = (b.h + 31) / 32;
+            /* One 8x8 and 32x32 range per frequency band.
+             * pyrowave_common.cpp WaveletBuffers::init_block_meta. */
             int first = (l == 4) ? 0 : 1;
             for (int band = first; band < 4; band++) {
                 BandJob j;
@@ -483,9 +485,9 @@ std::vector<BandJob> build_jobs(Encoder *enc)
                 j.off32 = count32;
                 j.stride32 = b32x;
                 jobs.push_back(j);
+                count8 += b8x * b8y;
+                count32 += b32x * b32y;
             }
-            count8 += b8x * b8y;
-            count32 += b32x * b32y;
         }
     }
     enc->total8 = count8;

@@ -17,6 +17,7 @@ static int fail(const char *what)
  * of the first word, sequence in bits 28..30.
  */
 static int check_record(const char *label, int W, int H, int expect_chroma,
+                        int min_blocks, unsigned min_max_index,
                         const std::vector<uint8_t> &bits, size_t nbytes, size_t packets)
 {
     if (nbytes < 8) {
@@ -40,16 +41,29 @@ static int check_record(const char *label, int W, int H, int expect_chroma,
 
     size_t off = 8;
     int seen = 0;
+    unsigned max_index = 0;
+    std::vector<unsigned> indices;
     while (off + 8 <= nbytes) {
-        uint32_t b0 = 0;
+        uint32_t b0 = 0, b1 = 0;
         std::memcpy(&b0, bits.data() + off, 4);
+        std::memcpy(&b1, bits.data() + off + 4, 4);
         unsigned words = (b0 >> 16) & 0xfffu;
         unsigned seq = (b0 >> 28) & 7u;
-        std::printf(" block words=%u seq=%u\n", words, seq);
+        unsigned index = b1 >> 8;
+        std::printf(" block words=%u seq=%u index=%u\n", words, seq, index);
         if (words < 2 || words > 640 || seq == 0) {
-            std::fprintf(stderr, "%s: block %d header words=%u seq=%u\n", label, seen, words, seq);
+            std::fprintf(stderr, "%s: block %d header words=%u seq=%u index=%u\n",
+                         label, seen, words, seq, index);
             return 1;
         }
+        for (unsigned prev : indices) {
+            if (prev == index) {
+                std::fprintf(stderr, "%s: duplicate block_index %u\n", label, index);
+                return 1;
+            }
+        }
+        indices.push_back(index);
+        if (index > max_index) max_index = index;
         size_t nbytes_block = size_t(words) * 4u;
         if (off + nbytes_block > nbytes) {
             std::fprintf(stderr, "%s: block %d overruns the record\n", label, seen);
@@ -58,9 +72,15 @@ static int check_record(const char *label, int W, int H, int expect_chroma,
         off += nbytes_block;
         seen++;
     }
+    std::printf("%s max_block_index=%u\n", label, max_index);
     if (off != nbytes || seen != blocks) {
         std::fprintf(stderr, "%s: walked %d blocks and %zu bytes, header says %d blocks and record is %zu\n",
                      label, seen, off, blocks, nbytes);
+        return 1;
+    }
+    if (blocks <= min_blocks || max_index < min_max_index) {
+        std::fprintf(stderr, "%s: blocks=%d max_block_index=%u, need more than %d blocks and max index >= %u\n",
+                     label, blocks, max_index, min_blocks, min_max_index);
         return 1;
     }
     return 0;
@@ -131,7 +151,11 @@ static int encode_one(pwgl_device dev, int W, int H, pwgl_chroma_subsampling chr
 
     size_t nbytes = 0;
     for (size_t i = 0; i < got; i++) nbytes += packets[i].size;
-    return check_record(label, W, H, is444 ? 1 : 0, bits, nbytes, got);
+    /* Aliased per-level slots top out at 16 (4:2:0) and 24 (4:4:4) for 64x64.
+     * A distinct range per frequency band reaches past those. */
+    int min_blocks = is444 ? 24 : 16;
+    unsigned min_max_index = is444 ? 60u : 40u;
+    return check_record(label, W, H, is444 ? 1 : 0, min_blocks, min_max_index, bits, nbytes, got);
 }
 
 int main()
