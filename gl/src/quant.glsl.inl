@@ -23,7 +23,7 @@ layout(std140, binding = 0) uniform Push {
     BandQ bands[4];
 };
 
-layout(std430, binding = 1) readonly buffer CoeffIn { float coeff[]; };
+layout(std430, binding = 1) readonly buffer CoeffIn { float coeff[]; } coeff_in;
 layout(std430, binding = 2) buffer Meta { uint u0[]; };
 layout(std430, binding = 3) buffer Stats { uint u1[]; };
 layout(std430, binding = 4) buffer Payload { uint u2[]; };
@@ -55,11 +55,6 @@ int msb_of(uint v)
     return findMSB(v);
 }
 
-uint f32tof16(float v)
-{
-    return packHalf2x16(vec2(v, 0.0)) & 0xffffu;
-}
-
 float make_pow2(int q)
 {
     return uintBitsToFloat(uint((127 + q) << 23));
@@ -70,7 +65,9 @@ float band_at(int layer, int x, int y)
     if (uint(x) >= uint(resolution.x) || uint(y) >= uint(resolution.y)) return 0.0;
     uint pitch_h = (uint(resolution.y) + 31u) & ~31u;
     uint idx = uint(layer) * coeff_pitch * pitch_h + uint(y) * coeff_pitch + uint(x);
-    return coeff[idx];
+    // A direct `return coeff[idx]` is error #247 on the HD 6670 compiler.
+    float v = coeff_in.coeff[idx];
+    return v;
 }
 
 void store_u32(uint byte_off, uint v)
